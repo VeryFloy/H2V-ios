@@ -31,25 +31,54 @@ jobs:
           true
           xcodebuild -version
 
-      # ── 3. Import signing certificate (macOS 13+ compatible) ─────────────────
+      # ── 3. Import signing certificate ────────────────────────────────────────
+      # macOS 13+ rejects p12 files with legacy 3DES/RC2 ciphers (old Xcode export).
+      # We use openssl to re-encrypt to modern AES-256 before calling security import.
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
         run: |
+          CERT_INPUT="$RUNNER_TEMP/cert_input.p12"
           CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          CERT_PEM="$RUNNER_TEMP/cert.pem"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          KEYCHAIN_PASSWORD="temp_keychain_password_h2v"
+          KEYCHAIN_PASSWORD="h2v_keychain_pass"
 
-          # Decode certificate
-          echo "$P12_BASE64" | base64 --decode -o "$CERT_PATH"
+          # ── Decode base64 (write via file to avoid shell escape issues)
+          printf '%s' "$P12_BASE64" | base64 --decode > "$CERT_INPUT"
+          echo "Decoded size: $(wc -c < "$CERT_INPUT") bytes"
+          echo "File type: $(file "$CERT_INPUT")"
 
-          # Create and configure keychain
+          # ── Re-encrypt with modern AES-256 cipher (fixes 3DES/RC2 rejection)
+          # Step 1: p12 → PEM (using -legacy flag to read old-format p12)
+          if openssl pkcs12 -legacy -in "$CERT_INPUT" \
+               -passin "pass:$P12_PASSWORD" \
+               -passout "pass:$P12_PASSWORD" \
+               -out "$CERT_PEM" 2>/dev/null; then
+            echo "Read as legacy p12, converting to modern format..."
+          else
+            echo "Trying modern format..."
+            openssl pkcs12 -in "$CERT_INPUT" \
+              -passin "pass:$P12_PASSWORD" \
+              -passout "pass:$P12_PASSWORD" \
+              -out "$CERT_PEM"
+          fi
+
+          # Step 2: PEM → modern p12 (AES-256 by default in OpenSSL 3)
+          openssl pkcs12 -export \
+            -in "$CERT_PEM" \
+            -out "$CERT_PATH" \
+            -passin "pass:$P12_PASSWORD" \
+            -passout "pass:$P12_PASSWORD"
+          echo "Modern p12 size: $(wc -c < "$CERT_PATH") bytes"
+
+          # ── Create and configure keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Import certificate with -A (allow all apps) and explicit format
+          # ── Import modern p12
           security import "$CERT_PATH" \
             -P "$P12_PASSWORD" \
             -A \
@@ -57,13 +86,13 @@ jobs:
             -f pkcs12 \
             -k "$KEYCHAIN_PATH"
 
-          # Add to keychain search list
+          # ── Add to keychain search list
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
-          # Verify import
+          # ── Verify identity was imported
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
-          rm "$CERT_PATH"
+          rm -f "$CERT_INPUT" "$CERT_PATH" "$CERT_PEM"
 
       # ── 4. Install provisioning profile ──────────────────────────────────────
       - name: Install provisioning profile
@@ -72,9 +101,12 @@ jobs:
         run: |
           PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILES_DIR"
-          echo "$PROFILE_BASE64" | base64 --decode -o "$PROFILES_DIR/h2v_adhoc.mobileprovision"
-          echo "Installed profile:"
-          ls -la "$PROFILES_DIR/"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode \
+            > "$PROFILES_DIR/h2v_adhoc.mobileprovision"
+          echo "Installed profile, UUID:"
+          /usr/libexec/PlistBuddy -c 'Print :UUID' \
+            /dev/stdin <<< $(security cms -D -i "$PROFILES_DIR/h2v_adhoc.mobileprovision") \
+            2>/dev/null || echo "(could not extract UUID)"
 
       # ── 5. Build & Archive ────────────────────────────────────────────────────
       - name: Build archive
