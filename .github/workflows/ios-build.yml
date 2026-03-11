@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     name: Build IPA (Ad Hoc)
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -23,15 +23,26 @@ jobs:
           fi
           echo "URLs OK"
 
-      # ── 2. Select Xcode 15.2 (ships with iOS 17.2 SDK = build 23C54,
-      #       which matches the simulator runtimes available on this runner)
+      # ── 2. Select Xcode 16.2 ─────────────────────────────────────────────────
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_15.1.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_15.app/Contents/Developer   || \
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || \
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer   || \
           true
           xcodebuild -version
+
+      # ── 2.5. Register iOS simulator runtime ──────────────────────────────────
+      # Xcode 16 actool checks simulator runtime even for device builds.
+      # xcodebuild -runFirstLaunch registers the bundled iOS 18.2 runtime.
+      - name: Register iOS simulator runtime
+        run: |
+          sudo xcodebuild -runFirstLaunch 2>&1 | tail -5 || true
+          # Also try to add bundled simruntime directly
+          RUNTIME="/Applications/Xcode_16.2.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Library/CoreSimulator/Profiles/Runtimes/iOS.simruntime"
+          if [ -d "$RUNTIME" ]; then
+            sudo xcrun simctl runtime add "$RUNTIME" 2>&1 || true
+          fi
+          xcrun simctl list runtimes 2>&1 | head -10
 
       # ── 3. Import signing certificate ────────────────────────────────────────
       - name: Import signing certificate
