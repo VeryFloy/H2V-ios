@@ -211,6 +211,7 @@ struct ChatListView: View {
                 showTabBar = path.isEmpty
             }
             if path.isEmpty {
+                appState.activeChatId = nil
                 Task { vm.loadChats(refresh: true) }
             }
         }
@@ -235,9 +236,10 @@ struct ChatListView: View {
         }
         .onAppear {
             vm.loadChats(refresh: true)
-            let uid = appState.currentUser?.id
-            wsSubscriberID = WebSocketClient.shared.subscribe { [weak vm] event in
-                vm?.handleWSEvent(event, currentUserId: uid)
+            // Capture appState weakly so currentUserId is resolved on every event,
+            // not frozen to its value at subscription time (which may be nil).
+            wsSubscriberID = WebSocketClient.shared.subscribe { [weak vm, weak appState] event in
+                vm?.handleWSEvent(event, currentUserId: appState?.currentUser?.id)
             }
         }
         .onDisappear {
@@ -325,6 +327,7 @@ struct ChatListView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             vm.unreadCounts[chat.id] = 0
+                            appState.activeChatId = chat.id
                             navPath.append(chat)
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {

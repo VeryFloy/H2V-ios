@@ -395,6 +395,12 @@ final class WebSocketClient: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectDelay: TimeInterval = 1.0
 
+    // Monotonically-incrementing generation ID.
+    // Each _connect() call bumps this so stale receive() callbacks
+    // from a previous connection are silently dropped, preventing
+    // the online→offline flicker race condition.
+    private var connectionGeneration: Int = 0
+
     // Dedicated URLSession: 10-sec TCP connection timeout, no resource timeout.
     private lazy var wsSession: URLSession = {
         let cfg = URLSessionConfiguration.default
@@ -406,15 +412,25 @@ final class WebSocketClient: ObservableObject {
 
     // MARK: - Public API
 
-    /// Connect using a specific token (also used after token refresh).
-    /// Passing nil reads the current token from TokenStorage.
+    /// Connect or no-op if already connected.
+    /// Pass a token only to force a reconnect with a specific credential.
     func connect(token: String? = nil) {
+        let t = token ?? TokenStorage.shared.accessToken
+        guard let t else { return }
+        // Don't tear down a healthy connection — this prevents the presence flicker
+        // that occurs when connect() is called redundantly (e.g., app lifecycle events).
+        guard !isConnected else { return }
+        _connect(token: t)
+    }
+
+    /// Force-reconnect even if currently connected (e.g. after token rotation).
+    func forceReconnect(token: String? = nil) {
         let t = token ?? TokenStorage.shared.accessToken
         guard let t else { return }
         _connect(token: t)
     }
 
-    /// Reconnect immediately with zero backoff delay (call when app becomes active).
+    /// Reconnect immediately with zero backoff (called when app becomes active).
     func reconnectNow() {
         guard let token = TokenStorage.shared.accessToken else { return }
         guard !isConnected else { return }
@@ -427,22 +443,22 @@ final class WebSocketClient: ObservableObject {
     func disconnect() {
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectDelay = 1.0
-        _teardown()
+        _teardown(graceful: true)
     }
 
     // MARK: - Private
 
     private func _connect(token: String) {
         reconnectTask?.cancel(); reconnectTask = nil
-        _teardown()
+        _teardown(graceful: false)   // not a logout — no .goingAway frame needed
+        connectionGeneration += 1
+        let gen = connectionGeneration
         guard let url = URL(string: "\(Config.wsURL)?token=\(token)") else { return }
         task = wsSession.webSocketTask(with: url)
         task?.resume()
-        // Send auth handshake as first message (mirrors frontend behaviour,
-        // keeps token out of server logs)
         send(event: "auth", payload: ["token": token])
         isConnected = true
-        receive()
+        receive(generation: gen)
         // Ping every 20 s — server drops idle connections after ~25 s
         pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.send(event: "presence:ping") }
@@ -450,9 +466,14 @@ final class WebSocketClient: ObservableObject {
         reconnectDelay = 1.0
     }
 
-    private func _teardown() {
+    private func _teardown(graceful: Bool) {
         pingTimer?.invalidate(); pingTimer = nil
-        task?.cancel(with: .goingAway, reason: nil); task = nil
+        if graceful {
+            task?.cancel(with: .goingAway, reason: nil)
+        } else {
+            task?.cancel()
+        }
+        task = nil
         isConnected = false
     }
 
@@ -465,25 +486,35 @@ final class WebSocketClient: ObservableObject {
             guard let self else { return }
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            self.connect()
+            // Use _connect directly (isConnected is false here, already checked upstream)
+            if let token = TokenStorage.shared.accessToken {
+                self._connect(token: token)
+            }
         }
     }
 
-    private func receive() {
+    private func receive(generation: Int) {
         task?.receive { [weak self] result in
             switch result {
             case .success(let msg):
                 if case .string(let text) = msg {
                     Task { @MainActor [weak self] in
-                        self?.isConnected = true
-                        self?.handle(text)
+                        guard let self, self.connectionGeneration == generation else { return }
+                        self.isConnected = true
+                        self.handle(text)
                     }
                 }
-                Task { @MainActor [weak self] in self?.receive() }
+                // Continue the receive loop — always dispatch on the same generation
+                Task { @MainActor [weak self] in
+                    guard let self, self.connectionGeneration == generation else { return }
+                    self.receive(generation: generation)
+                }
             case .failure:
                 Task { @MainActor [weak self] in
-                    self?.isConnected = false
-                    self?.scheduleReconnect()
+                    // Only react if this is still the current connection
+                    guard let self, self.connectionGeneration == generation else { return }
+                    self.isConnected = false
+                    self.scheduleReconnect()
                 }
             }
         }
