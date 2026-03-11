@@ -1,0 +1,18 @@
+# Xcode
+build/
+*.xcarchive
+*.ipa
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Secrets (never commit these)
+*.p12
+*.mobileprovision
+Certificates/
+
+# macOS
+.DS_Store
+
+# SwiftPM
+.swiftpm/
