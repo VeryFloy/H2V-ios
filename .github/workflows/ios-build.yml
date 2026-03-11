@@ -121,20 +121,30 @@ jobs:
           PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
         run: |
           if [ -z "$PROFILE_BASE64" ]; then
-            echo "ERROR: IOS_PROFILE_BASE64 secret is empty!"
+            echo "ERROR: IOS_PROVISIONING_PROFILE_BASE64 secret is empty!"
             exit 1
           fi
 
           PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILES_DIR"
 
-          echo "$PROFILE_BASE64"     \
-            | grep -v -- '-----'     \
-            | grep -v 'CertUtil'     \
-            | tr -d ' \t\r\n'        \
-            | base64 --decode > "$PROFILES_DIR/h2v_adhoc.mobileprovision"
+          PROFILE_PATH="$PROFILES_DIR/h2v_adhoc.mobileprovision"
+          echo "$PROFILE_BASE64"   \
+            | grep -v -- '-----'   \
+            | grep -v 'CertUtil'   \
+            | tr -d ' \t\r\n'      \
+            | base64 --decode > "$PROFILE_PATH"
 
-          echo "Profile size: $(wc -c < "$PROFILES_DIR/h2v_adhoc.mobileprovision" | tr -d ' ') bytes"
+          echo "Profile size: $(wc -c < "$PROFILE_PATH" | tr -d ' ') bytes"
+
+          # Extract UUID and rename file — xcodebuild finds profiles by UUID filename
+          UUID=$(security cms -D -i "$PROFILE_PATH" 2>/dev/null \
+            | /usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin)
+          echo "Profile UUID: $UUID"
+          mv "$PROFILE_PATH" "$PROFILES_DIR/$UUID.mobileprovision"
+
+          # Save UUID for xcodebuild step
+          echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
 
       # ── 5. Build & Archive ────────────────────────────────────────────────────
       - name: Build archive
@@ -147,8 +157,8 @@ jobs:
             -archivePath "$RUNNER_TEMP/h2v.xcarchive" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="iPhone Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="h2v_adhoc" \
-            DEVELOPMENT_TEAM=ZYDGWHPX4W \
+            PROVISIONING_PROFILE="$PROFILE_UUID" \
+            DEVELOPMENT_TEAM=XC7G4T565G \
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/app-signing.keychain-db"
 
       # ── 6. Export IPA ─────────────────────────────────────────────────────────
