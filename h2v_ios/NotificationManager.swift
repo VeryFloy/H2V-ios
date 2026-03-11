@@ -11,7 +11,9 @@ final class NotificationManager: NSObject, ObservableObject {
     @Published var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var apnsToken: String? = nil
 
-    var isAuthorized: Bool { authorizationStatus == .authorized }
+    var isAuthorized: Bool {
+        authorizationStatus == .authorized || authorizationStatus == .provisional
+    }
 
     private var badgeCount = 0
     private var avatarCache: [String: URL] = [:]   // senderName → local file URL
@@ -31,8 +33,11 @@ final class NotificationManager: NSObject, ObservableObject {
 
     func requestPermission() async {
         do {
+            // No .provisional — we need .authorized so banners and sounds are shown.
+            // Provisional silently drops to Notification Center with no banner/sound
+            // AND sets status to .provisional (not .authorized), breaking isAuthorized.
             let granted = try await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .badge, .sound, .provisional])
+                .requestAuthorization(options: [.alert, .badge, .sound])
             authorizationStatus = granted ? .authorized : .denied
             if granted {
                 await MainActor.run {
