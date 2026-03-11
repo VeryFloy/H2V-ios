@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>ad-hoc</string>
+    <string>release-testing</string>
     <key>teamID</key>
-    <string>ZYDGWHPX4W</string>
+    <string>XC7G4T565G</string>
     <key>compileBitcode</key>
     <false/>
     <key>stripSwiftSymbols</key>
@@ -16,8 +16,8 @@
     <string>manual</string>
     <key>provisioningProfiles</key>
     <dict>
-        <key>a2.h2v-ios</key>
-        <string>h2v_adhoc</string>
+        <key>app.storm954.quinoa167</key>
+        <string>803396da-d256-424c-8a14-179a3ffe3012</string>
     </dict>
 </dict>
 </plist>
