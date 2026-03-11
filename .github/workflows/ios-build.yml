@@ -23,26 +23,29 @@ jobs:
           fi
           echo "URLs OK"
 
-      # ── 2. Select Xcode 16.2 ─────────────────────────────────────────────────
+      # ── 2. Select latest Xcode 16 available on runner ────────────────────────
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer   || \
-          true
+          # Use the latest available Xcode 16.x (runner updates regularly)
+          for ver in 16.6 16.5 16.4 16.3 16.2 16.1 16.0; do
+            XCODE_PATH="/Applications/Xcode_${ver}.app/Contents/Developer"
+            if [ -d "$XCODE_PATH" ]; then
+              sudo xcode-select -s "$XCODE_PATH"
+              echo "Selected Xcode $ver"
+              break
+            fi
+          done
           xcodebuild -version
+          echo "Available iOS SDKs:"
+          xcodebuild -showsdks 2>/dev/null | grep iphoneos || true
 
-      # ── 2.5. Register iOS simulator runtime ──────────────────────────────────
-      # Xcode 16 actool checks simulator runtime even for device builds.
-      # xcodebuild -runFirstLaunch registers the bundled iOS 18.2 runtime.
-      - name: Register iOS simulator runtime
+      # ── 2.5. Ensure iOS device platform is installed ─────────────────────────
+      - name: Install iOS platform
         run: |
-          sudo xcodebuild -runFirstLaunch 2>&1 | tail -5 || true
-          # Also try to add bundled simruntime directly
-          RUNTIME="/Applications/Xcode_16.2.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Library/CoreSimulator/Profiles/Runtimes/iOS.simruntime"
-          if [ -d "$RUNTIME" ]; then
-            sudo xcrun simctl runtime add "$RUNTIME" 2>&1 || true
-          fi
-          xcrun simctl list runtimes 2>&1 | head -10
+          sudo xcodebuild -runFirstLaunch 2>&1 | tail -3 || true
+          # Download iOS device platform if missing
+          xcodebuild -downloadPlatform iOS 2>&1 | tail -5 || true
+          xcrun simctl list runtimes 2>&1 | grep -i "ios" | head -5
 
       # ── 3. Import signing certificate ────────────────────────────────────────
       - name: Import signing certificate
@@ -164,7 +167,6 @@ jobs:
             -project h2v_ios.xcodeproj \
             -scheme h2v_ios \
             -configuration Release \
-            -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -archivePath "$RUNNER_TEMP/h2v.xcarchive" \
             CODE_SIGN_STYLE=Manual \
@@ -174,9 +176,7 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/app-signing.keychain-db" \
             SUPPORTS_MACCATALYST=NO \
             SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            IPHONEOS_DEPLOYMENT_TARGET=17.0 \
-            ENABLE_ON_DEMAND_RESOURCES=NO
+            ONLY_ACTIVE_ARCH=NO
 
       # ── 6. Export IPA ─────────────────────────────────────────────────────────
       - name: Export IPA
