@@ -137,14 +137,12 @@ jobs:
 
           echo "Profile size: $(wc -c < "$PROFILE_PATH" | tr -d ' ') bytes"
 
-          # Extract UUID and rename file — xcodebuild finds profiles by UUID filename
-          UUID=$(security cms -D -i "$PROFILE_PATH" 2>/dev/null \
-            | /usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin)
-          echo "Profile UUID: $UUID"
-          mv "$PROFILE_PATH" "$PROFILES_DIR/$UUID.mobileprovision"
-
-          # Save UUID for xcodebuild step
-          echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
+          # UUID is known from local analysis — rename to UUID.mobileprovision
+          # (xcodebuild finds profiles by UUID filename, not by arbitrary name)
+          PROFILE_UUID="803396da-d256-424c-8a14-179a3ffe3012"
+          mv "$PROFILE_PATH" "$PROFILES_DIR/$PROFILE_UUID.mobileprovision"
+          echo "Profile installed as: $PROFILE_UUID.mobileprovision"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
 
       # ── 5. Build & Archive ────────────────────────────────────────────────────
       - name: Build archive
