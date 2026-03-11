@@ -6,11 +6,14 @@ struct APIResponse<T: Decodable>: Decodable {
     let success: Bool
     let data: T?
     let message: String?
+    let code: String?
 }
 
 struct MessageResponse: Decodable {
     let message: String
 }
+
+struct VoidData: Decodable {}
 
 // MARK: - Auth
 

@@ -3,8 +3,8 @@ import Foundation
 // MARK: - Config
 
 enum Config {
-    static let baseURL = "http://localhost:3000"
-    static let wsURL   = "ws://localhost:3000/ws"
+    static let baseURL = "https://h2von.com"
+    static let wsURL   = "wss://h2von.com/ws"
 }
 
 // MARK: - Token Storage
@@ -38,15 +38,19 @@ enum NetworkError: LocalizedError {
     case noToken, invalidURL, unauthorized, unknown
     case serverError(String)
     case decodingError(String)
+    case nicknameRequired
+    case otpExpired
 
     var errorDescription: String? {
         switch self {
-        case .noToken:              return "Not authenticated"
-        case .invalidURL:           return "Invalid URL"
-        case .unauthorized:         return "Session expired. Please sign in again."
-        case .unknown:              return "Unknown error"
+        case .noToken:              return "Не авторизован"
+        case .invalidURL:           return "Неверный URL"
+        case .unauthorized:         return "Сессия истекла, войди снова"
+        case .unknown:              return "Неизвестная ошибка"
         case .serverError(let m):   return m
-        case .decodingError(let m): return "Decode error: \(m)"
+        case .decodingError(let m): return "Ошибка данных: \(m)"
+        case .nicknameRequired:     return "Требуется никнейм"
+        case .otpExpired:           return "Код истёк или неверен"
         }
     }
 }
@@ -80,36 +84,96 @@ final class APIClient {
         do {
             let envelope = try JSONDecoder().decode(APIResponse<T>.self, from: data)
             if let result = envelope.data { return result }
-            throw NetworkError.serverError(envelope.message ?? "Unknown error")
+            // Map known error codes to typed errors
+            switch envelope.code {
+            case "NICKNAME_REQUIRED":             throw NetworkError.nicknameRequired
+            case "OTP_EXPIRED", "INVALID_CODE":   throw NetworkError.otpExpired
+            default:
+                throw NetworkError.serverError(envelope.message ?? "Unknown error")
+            }
         } catch let ne as NetworkError { throw ne } catch {
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let msg = json["message"] as? String { throw NetworkError.serverError(msg) }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let code = json["code"] as? String {
+                    switch code {
+                    case "NICKNAME_REQUIRED": throw NetworkError.nicknameRequired
+                    case "OTP_EXPIRED", "INVALID_CODE": throw NetworkError.otpExpired
+                    default: break
+                    }
+                }
+                if let msg = json["message"] as? String { throw NetworkError.serverError(msg) }
+            }
             throw NetworkError.decodingError(error.localizedDescription)
+        }
+    }
+
+    // Endpoints that return no meaningful data (success/fail only)
+    private func requestVoid(
+        path: String,
+        method: String = "POST",
+        bodyData: Data? = nil,
+        authenticated: Bool = true
+    ) async throws {
+        guard let url = URL(string: Config.baseURL + path) else { throw NetworkError.invalidURL }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if authenticated {
+            guard let token = TokenStorage.shared.accessToken else { throw NetworkError.noToken }
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.httpBody = bodyData
+        let (data, response) = try await URLSession.shared.data(for: req)
+        if (response as? HTTPURLResponse)?.statusCode == 401 { throw NetworkError.unauthorized }
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let success = json["success"] as? Bool ?? true
+            if !success {
+                if let msg = json["message"] as? String { throw NetworkError.serverError(msg) }
+                throw NetworkError.unknown
+            }
         }
     }
 
     private func body<B: Encodable>(_ value: B) throws -> Data { try JSONEncoder().encode(value) }
 
-    // MARK: - Auth
+    // MARK: - Auth (OTP-based)
 
-    func register(nickname: String, email: String, password: String) async throws -> AuthData {
-        struct B: Encodable { let nickname, email, password: String }
-        return try await request(path: "/api/auth/register", method: "POST",
-                                 bodyData: try body(B(nickname: nickname, email: email, password: password)),
-                                 authenticated: false)
+    func sendOtp(email: String) async throws {
+        struct B: Encodable { let email: String }
+        try await requestVoid(
+            path: "/api/auth/send-otp",
+            bodyData: try body(B(email: email)),
+            authenticated: false
+        )
     }
 
-    func login(email: String, password: String) async throws -> AuthData {
-        struct B: Encodable { let email, password: String }
-        return try await request(path: "/api/auth/login", method: "POST",
-                                 bodyData: try body(B(email: email, password: password)),
-                                 authenticated: false)
+    func verifyOtp(email: String, code: String, nickname: String? = nil) async throws -> AuthData {
+        struct B: Encodable { let email, code: String; let nickname: String? }
+        return try await request(
+            path: "/api/auth/verify-otp",
+            method: "POST",
+            bodyData: try body(B(email: email, code: code, nickname: nickname)),
+            authenticated: false
+        )
     }
 
     func logout(refreshToken: String) async {
         struct B: Encodable { let refreshToken: String }
-        let _: MessageResponse? = try? await request(path: "/api/auth/logout", method: "POST",
-                                                      bodyData: try? body(B(refreshToken: refreshToken)))
+        let _: MessageResponse? = try? await request(
+            path: "/api/auth/logout",
+            method: "POST",
+            bodyData: try? body(B(refreshToken: refreshToken))
+        )
+    }
+
+    func refreshTokens() async throws -> Tokens {
+        struct B: Encodable { let refreshToken: String }
+        guard let rt = TokenStorage.shared.refreshToken else { throw NetworkError.noToken }
+        return try await request(
+            path: "/api/auth/refresh",
+            method: "POST",
+            bodyData: try body(B(refreshToken: rt)),
+            authenticated: false
+        )
     }
 
     // MARK: - Users
@@ -118,11 +182,16 @@ final class APIClient {
 
     func updateMe(nickname: String? = nil, bio: String? = nil, avatar: String? = nil) async throws -> User {
         struct B: Encodable { let nickname: String?; let bio: String?; let avatar: String? }
-        return try await request(path: "/api/users/me", method: "PATCH",
-                                 bodyData: try body(B(nickname: nickname, bio: bio, avatar: avatar)))
+        return try await request(
+            path: "/api/users/me",
+            method: "PATCH",
+            bodyData: try body(B(nickname: nickname, bio: bio, avatar: avatar))
+        )
     }
 
-    func deleteAccount() async throws { let _: MessageResponse = try await request(path: "/api/users/me", method: "DELETE") }
+    func deleteAccount() async throws {
+        let _: MessageResponse = try await request(path: "/api/users/me", method: "DELETE")
+    }
 
     func searchUsers(query: String) async throws -> [User] {
         let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
@@ -141,14 +210,20 @@ final class APIClient {
 
     func createDirectChat(targetUserId: String) async throws -> Chat {
         struct B: Encodable { let targetUserId: String }
-        return try await request(path: "/api/chats/direct", method: "POST",
-                                 bodyData: try body(B(targetUserId: targetUserId)))
+        return try await request(
+            path: "/api/chats/direct",
+            method: "POST",
+            bodyData: try body(B(targetUserId: targetUserId))
+        )
     }
 
     func createGroupChat(name: String, memberIds: [String]) async throws -> Chat {
         struct B: Encodable { let name: String; let memberIds: [String] }
-        return try await request(path: "/api/chats/group", method: "POST",
-                                 bodyData: try body(B(name: name, memberIds: memberIds)))
+        return try await request(
+            path: "/api/chats/group",
+            method: "POST",
+            bodyData: try body(B(name: name, memberIds: memberIds))
+        )
     }
 
     func leaveChat(chatId: String) async throws {
@@ -169,24 +244,36 @@ final class APIClient {
 
     func editMessage(id: String, text: String) async throws -> Message {
         struct B: Encodable { let text: String }
-        return try await request(path: "/api/messages/\(id)", method: "PATCH",
-                                 bodyData: try body(B(text: text)))
+        return try await request(
+            path: "/api/messages/\(id)",
+            method: "PATCH",
+            bodyData: try body(B(text: text))
+        )
     }
 
     func markRead(messageId: String) async throws {
-        let _: MessageResponse = try await request(path: "/api/messages/\(messageId)/read", method: "POST")
+        let _: MessageResponse = try await request(
+            path: "/api/messages/\(messageId)/read",
+            method: "POST"
+        )
     }
 
     func addReaction(messageId: String, emoji: String) async throws {
         struct B: Encodable { let emoji: String }
         struct R: Decodable { let id: String }
-        let _: R = try await request(path: "/api/messages/\(messageId)/reactions", method: "POST",
-                                      bodyData: try body(B(emoji: emoji)))
+        let _: R = try await request(
+            path: "/api/messages/\(messageId)/reactions",
+            method: "POST",
+            bodyData: try body(B(emoji: emoji))
+        )
     }
 
     func removeReaction(messageId: String, emoji: String) async throws {
         let enc = emoji.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? emoji
-        let _: MessageResponse = try await request(path: "/api/messages/\(messageId)/reactions/\(enc)", method: "DELETE")
+        let _: MessageResponse = try await request(
+            path: "/api/messages/\(messageId)/reactions/\(enc)",
+            method: "DELETE"
+        )
     }
 
     // MARK: - Upload
@@ -210,7 +297,9 @@ final class APIClient {
         let (respData, response) = try await URLSession.shared.data(for: req)
         if (response as? HTTPURLResponse)?.statusCode == 401 { throw NetworkError.unauthorized }
         let decoded = try JSONDecoder().decode(APIResponse<UploadResult>.self, from: respData)
-        guard let result = decoded.data else { throw NetworkError.serverError(decoded.message ?? "Upload failed") }
+        guard let result = decoded.data else {
+            throw NetworkError.serverError(decoded.message ?? "Upload failed")
+        }
         return result
     }
 }
