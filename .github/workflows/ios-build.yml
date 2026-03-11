@@ -1,20 +1,48 @@
-name: iOS Build & Sign
+name: iOS Build & Release
 
 on:
   push:
     branches: [main, master]
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a GitHub Release after build"
+        type: boolean
+        default: false
 
 jobs:
   build:
-    name: Build IPA (Ad Hoc)
+    name: 🔨 Build IPA
     runs-on: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # ── 1. Validate: no localhost URLs ───────────────────────────────────────
+      # ── Version ──────────────────────────────────────────────────────────────
+      - name: Compute version & build number
+        id: ver
+        run: |
+          # Marketing version: from git tag (v1.2.3 → 1.2.3) or pbxproj fallback
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            MKTVER="${GITHUB_REF_NAME#v}"
+          else
+            MKTVER=$(grep 'MARKETING_VERSION' h2v_ios.xcodeproj/project.pbxproj \
+                       | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+            MKTVER="${MKTVER:-1.0}"
+          fi
+          # Build number = total git commit count (auto-increments with every push)
+          BUILD=$(git rev-list --count HEAD)
+          echo "MKTVER=$MKTVER"   >> "$GITHUB_OUTPUT"
+          echo "BUILD=$BUILD"     >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=v$MKTVER" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: $MKTVER  Build: $BUILD"
+
+      # ── Validate ─────────────────────────────────────────────────────────────
       - name: Check production URLs
         run: |
           if grep -r "localhost" h2v_ios/Network.swift; then
@@ -23,10 +51,9 @@ jobs:
           fi
           echo "URLs OK"
 
-      # ── 2. Select latest Xcode 16 available on runner ────────────────────────
+      # ── Xcode ────────────────────────────────────────────────────────────────
       - name: Select Xcode
         run: |
-          # Use the latest available Xcode 16.x (runner updates regularly)
           for ver in 16.6 16.5 16.4 16.3 16.2 16.1 16.0; do
             XCODE_PATH="/Applications/Xcode_${ver}.app/Contents/Developer"
             if [ -d "$XCODE_PATH" ]; then
@@ -36,18 +63,13 @@ jobs:
             fi
           done
           xcodebuild -version
-          echo "Available iOS SDKs:"
-          xcodebuild -showsdks 2>/dev/null | grep iphoneos || true
 
-      # ── 2.5. Ensure iOS device platform is installed ─────────────────────────
       - name: Install iOS platform
         run: |
           sudo xcodebuild -runFirstLaunch 2>&1 | tail -3 || true
-          # Download iOS device platform if missing
           xcodebuild -downloadPlatform iOS 2>&1 | tail -5 || true
-          xcrun simctl list runtimes 2>&1 | grep -i "ios" | head -5
 
-      # ── 3. Import signing certificate ────────────────────────────────────────
+      # ── Signing ───────────────────────────────────────────────────────────────
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
@@ -59,52 +81,34 @@ jobs:
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="h2v_keychain_pass"
 
-          # Check secret is set
           if [ -z "$P12_BASE64" ]; then
-            echo "ERROR: IOS_P12_BASE64 secret is empty or not set!"
-            echo "On Windows, create it with PowerShell:"
-            echo '  [Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.p12"))'
+            echo "ERROR: IOS_CERTIFICATE_BASE64 secret is empty!"
             exit 1
           fi
-          echo "Secret length: ${#P12_BASE64} chars"
 
-          # Clean and decode:
-          # - Strip certutil headers (-----BEGIN/END CERTIFICATE-----)
-          # - Strip "CertUtil: ..." lines
-          # - Remove all whitespace/CRLF/spaces
-          echo "$P12_BASE64"          \
-            | grep -v -- '-----'      \
-            | grep -v 'CertUtil'      \
-            | tr -d ' \t\r\n'         \
+          echo "$P12_BASE64" \
+            | grep -v -- '-----' \
+            | grep -v 'CertUtil' \
+            | tr -d ' \t\r\n' \
             | base64 --decode > "$CERT_INPUT"
 
           FILESIZE=$(wc -c < "$CERT_INPUT" | tr -d ' ')
-          echo "Decoded size: $FILESIZE bytes"
-          echo "File type: $(file "$CERT_INPUT")"
-
+          echo "Decoded cert size: $FILESIZE bytes"
           if [ "$FILESIZE" -eq 0 ]; then
-            echo "ERROR: Decoded file is empty."
-            echo "Re-create IOS_P12_BASE64 secret on Windows using PowerShell:"
-            echo '  [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\cert.p12"))'
+            echo "ERROR: Decoded cert is empty."
             exit 1
           fi
 
-          # Re-encrypt with modern AES-256 (macOS 13+ rejects legacy 3DES p12)
-          echo "Converting p12 to modern AES-256 cipher..."
           if openssl pkcs12 -legacy -in "$CERT_INPUT" \
                -passin "pass:$P12_PASSWORD" \
                -passout "pass:$P12_PASSWORD" \
                -out "$CERT_PEM" 2>/dev/null; then
-            echo "Legacy p12 detected, converted to PEM"
+            echo "Legacy p12 → converted to PEM"
           else
             openssl pkcs12 -in "$CERT_INPUT" \
               -passin "pass:$P12_PASSWORD" \
               -passout "pass:$P12_PASSWORD" \
-              -out "$CERT_PEM" || {
-                echo "ERROR: Cannot open p12. Check IOS_P12_PASSWORD secret."
-                exit 1
-              }
-            echo "Modern p12, converted to PEM"
+              -out "$CERT_PEM" || { echo "ERROR: Cannot open p12."; exit 1; }
           fi
 
           openssl pkcs12 -export \
@@ -112,26 +116,17 @@ jobs:
             -out "$CERT_PATH" \
             -passin "pass:$P12_PASSWORD" \
             -passout "pass:$P12_PASSWORD"
-          echo "Modern p12 size: $(wc -c < "$CERT_PATH" | tr -d ' ') bytes"
 
-          # Create and configure keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Import modern p12
           security import "$CERT_PATH" \
-            -P "$P12_PASSWORD" \
-            -A -t cert -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
-
-          # Add to search list and verify
+            -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
           rm -f "$CERT_INPUT" "$CERT_PATH" "$CERT_PEM"
 
-      # ── 4. Install provisioning profile ──────────────────────────────────────
       - name: Install provisioning profile
         env:
           PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
@@ -145,22 +140,20 @@ jobs:
           mkdir -p "$PROFILES_DIR"
 
           PROFILE_PATH="$PROFILES_DIR/h2v_adhoc.mobileprovision"
-          echo "$PROFILE_BASE64"   \
-            | grep -v -- '-----'   \
-            | grep -v 'CertUtil'   \
-            | tr -d ' \t\r\n'      \
+          echo "$PROFILE_BASE64" \
+            | grep -v -- '-----' \
+            | grep -v 'CertUtil' \
+            | tr -d ' \t\r\n' \
             | base64 --decode > "$PROFILE_PATH"
 
           echo "Profile size: $(wc -c < "$PROFILE_PATH" | tr -d ' ') bytes"
 
-          # UUID is known from local analysis — rename to UUID.mobileprovision
-          # (xcodebuild finds profiles by UUID filename, not by arbitrary name)
           PROFILE_UUID="803396da-d256-424c-8a14-179a3ffe3012"
           mv "$PROFILE_PATH" "$PROFILES_DIR/$PROFILE_UUID.mobileprovision"
-          echo "Profile installed as: $PROFILE_UUID.mobileprovision"
-          echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+          echo "Profile installed: $PROFILE_UUID.mobileprovision"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
 
-      # ── 5. Build & Archive ────────────────────────────────────────────────────
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build archive
         run: |
           xcodebuild archive \
@@ -174,11 +167,12 @@ jobs:
             PROVISIONING_PROFILE="$PROFILE_UUID" \
             DEVELOPMENT_TEAM=XC7G4T565G \
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/app-signing.keychain-db" \
+            MARKETING_VERSION="${{ steps.ver.outputs.MKTVER }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.BUILD }}" \
             SUPPORTS_MACCATALYST=NO \
             SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=NO \
             ONLY_ACTIVE_ARCH=NO
 
-      # ── 6. Export IPA ─────────────────────────────────────────────────────────
       - name: Export IPA
         run: |
           xcodebuild -exportArchive \
@@ -186,10 +180,40 @@ jobs:
             -exportPath "$RUNNER_TEMP/ipa" \
             -exportOptionsPlist ExportOptions.plist
 
-      # ── 7. Upload artifact ────────────────────────────────────────────────────
-      - name: Upload IPA
+      # Name the IPA with version + build so it's easy to identify
+      - name: Rename IPA
+        run: |
+          IPA=$(find "$RUNNER_TEMP/ipa" -name "*.ipa" | head -1)
+          DEST="$RUNNER_TEMP/ipa/H2V-v${{ steps.ver.outputs.MKTVER }}-build${{ steps.ver.outputs.BUILD }}.ipa"
+          mv "$IPA" "$DEST"
+          echo "IPA_PATH=$DEST" >> "$GITHUB_ENV"
+
+      # ── Artifact ──────────────────────────────────────────────────────────────
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: H2V-iOS-${{ github.sha }}
-          path: ${{ runner.temp }}/ipa/*.ipa
-          retention-days: 30
+          name: H2V-v${{ steps.ver.outputs.MKTVER }}-build${{ steps.ver.outputs.BUILD }}
+          path: ${{ env.IPA_PATH }}
+          retention-days: 90
+
+      # ── GitHub Release (only on version tags or manual trigger) ───────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.TAG_NAME }}
+          name: "H2V iOS ${{ steps.ver.outputs.TAG_NAME }}"
+          body: |
+            ## H2V Messenger iOS ${{ steps.ver.outputs.TAG_NAME }}
+
+            **Build:** `${{ steps.ver.outputs.BUILD }}`
+            **Commit:** `${{ github.sha }}`
+
+            ### Изменения
+            ${{ github.event.head_commit.message }}
+
+            ---
+            > Установка: скачай `.ipa` и установи через [AltStore](https://altstore.io) или [Sideloadly](https://sideloadly.io).
+          files: ${{ env.IPA_PATH }}
+          draft: false
+          prerelease: false

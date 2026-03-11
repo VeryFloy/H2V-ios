@@ -262,6 +262,7 @@ struct ChatView: View {
     @State private var mediaViewerIndex: Int = 0
     @State private var showMediaViewer = false
     @State private var wsSubscriberID: UUID? = nil
+    @State private var didInitialScroll = false
 
     init(chat: Chat) {
         _vm = StateObject(wrappedValue: ChatViewModel(chat: chat))
@@ -509,13 +510,25 @@ struct ChatView: View {
                 .padding(.vertical, 8)
             }
             .scrollIndicators(.hidden)
-            .onChange(of: vm.messages.count) { _, _ in
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom") }
+            .onChange(of: vm.messages.count) { oldCount, newCount in
+                if !didInitialScroll {
+                    // First batch loaded — jump instantly, no animation
+                    proxy.scrollTo("bottom")
+                    didInitialScroll = true
+                } else if newCount > oldCount {
+                    // New incoming/sent message — smooth scroll
+                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo("bottom") }
+                }
             }
-            .onChange(of: vm.typingLabel) { _, _ in
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom") }
+            .onChange(of: vm.typingLabel) { _, label in
+                if label != nil {
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom") }
+                }
             }
-            .onAppear { proxy.scrollTo("bottom") }
+            .onAppear {
+                proxy.scrollTo("bottom")
+                didInitialScroll = false
+            }
         }
     }
 

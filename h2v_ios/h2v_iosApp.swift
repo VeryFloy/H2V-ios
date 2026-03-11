@@ -193,6 +193,7 @@ struct h2v_iosApp: App {
     @StateObject private var appState = AppState()
     @StateObject private var notifManager = NotificationManager.shared
 
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("h2v.colorScheme") private var colorScheme = "dark"
 
     private var preferredScheme: ColorScheme? {
@@ -214,6 +215,13 @@ struct h2v_iosApp: App {
                 }
                 .onChange(of: appState.isAuthenticated) { _, authenticated in
                     if authenticated { NotificationManager.shared.clearBadge() }
+                }
+                // Reconnect WS immediately when app returns to foreground
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active && appState.isAuthenticated {
+                        NotificationManager.shared.clearBadge()
+                        WebSocketClient.shared.reconnectNow()
+                    }
                 }
                 // Navigate to chat on notification tap
                 .onReceive(NotificationCenter.default.publisher(for: Notification.Name("h2v.openChat"))) { notif in

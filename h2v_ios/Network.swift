@@ -395,6 +395,15 @@ final class WebSocketClient: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectDelay: TimeInterval = 1.0
 
+    // Dedicated URLSession: 10-sec TCP connection timeout, no resource timeout.
+    private lazy var wsSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = .infinity
+        cfg.waitsForConnectivity = true
+        return URLSession(configuration: cfg)
+    }()
+
     // MARK: - Public API
 
     /// Connect using a specific token (also used after token refresh).
@@ -403,6 +412,15 @@ final class WebSocketClient: ObservableObject {
         let t = token ?? TokenStorage.shared.accessToken
         guard let t else { return }
         _connect(token: t)
+    }
+
+    /// Reconnect immediately with zero backoff delay (call when app becomes active).
+    func reconnectNow() {
+        guard let token = TokenStorage.shared.accessToken else { return }
+        guard !isConnected else { return }
+        reconnectTask?.cancel(); reconnectTask = nil
+        reconnectDelay = 1.0
+        _connect(token: token)
     }
 
     /// Intentional disconnect (logout). Cancels any pending reconnect.
@@ -418,14 +436,15 @@ final class WebSocketClient: ObservableObject {
         reconnectTask?.cancel(); reconnectTask = nil
         _teardown()
         guard let url = URL(string: "\(Config.wsURL)?token=\(token)") else { return }
-        task = URLSession.shared.webSocketTask(with: url)
+        task = wsSession.webSocketTask(with: url)
         task?.resume()
         // Send auth handshake as first message (mirrors frontend behaviour,
         // keeps token out of server logs)
         send(event: "auth", payload: ["token": token])
         isConnected = true
         receive()
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // Ping every 20 s — server drops idle connections after ~25 s
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.send(event: "presence:ping") }
         }
         reconnectDelay = 1.0
