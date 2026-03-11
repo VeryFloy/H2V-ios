@@ -161,7 +161,8 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/app-signing.keychain-db" \
             SUPPORTS_MACCATALYST=NO \
             SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD=NO \
-            ONLY_ACTIVE_ARCH=NO
+            ONLY_ACTIVE_ARCH=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=17.0
 
       # ── 6. Export IPA ─────────────────────────────────────────────────────────
       - name: Export IPA
