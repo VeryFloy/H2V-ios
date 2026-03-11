@@ -32,8 +32,6 @@ jobs:
           xcodebuild -version
 
       # ── 3. Import signing certificate ────────────────────────────────────────
-      # macOS 13+ rejects p12 files with legacy 3DES/RC2 ciphers (old Xcode export).
-      # We use openssl to re-encrypt to modern AES-256 before calling security import.
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
@@ -45,51 +43,74 @@ jobs:
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="h2v_keychain_pass"
 
-          # ── Decode base64 (write via file to avoid shell escape issues)
-          printf '%s' "$P12_BASE64" | base64 --decode > "$CERT_INPUT"
-          echo "Decoded size: $(wc -c < "$CERT_INPUT") bytes"
+          # Check secret is set
+          if [ -z "$P12_BASE64" ]; then
+            echo "ERROR: IOS_P12_BASE64 secret is empty or not set!"
+            echo "On Windows, create it with PowerShell:"
+            echo '  [Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.p12"))'
+            exit 1
+          fi
+          echo "Secret length: ${#P12_BASE64} chars"
+
+          # Clean and decode:
+          # - Strip certutil headers (-----BEGIN/END CERTIFICATE-----)
+          # - Strip "CertUtil: ..." lines
+          # - Remove all whitespace/CRLF/spaces
+          echo "$P12_BASE64"          \
+            | grep -v -- '-----'      \
+            | grep -v 'CertUtil'      \
+            | tr -d ' \t\r\n'         \
+            | base64 --decode > "$CERT_INPUT"
+
+          FILESIZE=$(wc -c < "$CERT_INPUT" | tr -d ' ')
+          echo "Decoded size: $FILESIZE bytes"
           echo "File type: $(file "$CERT_INPUT")"
 
-          # ── Re-encrypt with modern AES-256 cipher (fixes 3DES/RC2 rejection)
-          # Step 1: p12 → PEM (using -legacy flag to read old-format p12)
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "ERROR: Decoded file is empty."
+            echo "Re-create IOS_P12_BASE64 secret on Windows using PowerShell:"
+            echo '  [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\cert.p12"))'
+            exit 1
+          fi
+
+          # Re-encrypt with modern AES-256 (macOS 13+ rejects legacy 3DES p12)
+          echo "Converting p12 to modern AES-256 cipher..."
           if openssl pkcs12 -legacy -in "$CERT_INPUT" \
                -passin "pass:$P12_PASSWORD" \
                -passout "pass:$P12_PASSWORD" \
                -out "$CERT_PEM" 2>/dev/null; then
-            echo "Read as legacy p12, converting to modern format..."
+            echo "Legacy p12 detected, converted to PEM"
           else
-            echo "Trying modern format..."
             openssl pkcs12 -in "$CERT_INPUT" \
               -passin "pass:$P12_PASSWORD" \
               -passout "pass:$P12_PASSWORD" \
-              -out "$CERT_PEM"
+              -out "$CERT_PEM" || {
+                echo "ERROR: Cannot open p12. Check IOS_P12_PASSWORD secret."
+                exit 1
+              }
+            echo "Modern p12, converted to PEM"
           fi
 
-          # Step 2: PEM → modern p12 (AES-256 by default in OpenSSL 3)
           openssl pkcs12 -export \
             -in "$CERT_PEM" \
             -out "$CERT_PATH" \
             -passin "pass:$P12_PASSWORD" \
             -passout "pass:$P12_PASSWORD"
-          echo "Modern p12 size: $(wc -c < "$CERT_PATH") bytes"
+          echo "Modern p12 size: $(wc -c < "$CERT_PATH" | tr -d ' ') bytes"
 
-          # ── Create and configure keychain
+          # Create and configure keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # ── Import modern p12
+          # Import modern p12
           security import "$CERT_PATH" \
             -P "$P12_PASSWORD" \
-            -A \
-            -t cert \
-            -f pkcs12 \
+            -A -t cert -f pkcs12 \
             -k "$KEYCHAIN_PATH"
 
-          # ── Add to keychain search list
+          # Add to search list and verify
           security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-          # ── Verify identity was imported
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
           rm -f "$CERT_INPUT" "$CERT_PATH" "$CERT_PEM"
@@ -99,14 +120,21 @@ jobs:
         env:
           PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
         run: |
+          if [ -z "$PROFILE_BASE64" ]; then
+            echo "ERROR: IOS_PROFILE_BASE64 secret is empty!"
+            exit 1
+          fi
+
           PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILES_DIR"
-          printf '%s' "$PROFILE_BASE64" | base64 --decode \
-            > "$PROFILES_DIR/h2v_adhoc.mobileprovision"
-          echo "Installed profile, UUID:"
-          /usr/libexec/PlistBuddy -c 'Print :UUID' \
-            /dev/stdin <<< $(security cms -D -i "$PROFILES_DIR/h2v_adhoc.mobileprovision") \
-            2>/dev/null || echo "(could not extract UUID)"
+
+          echo "$PROFILE_BASE64"     \
+            | grep -v -- '-----'     \
+            | grep -v 'CertUtil'     \
+            | tr -d ' \t\r\n'        \
+            | base64 --decode > "$PROFILES_DIR/h2v_adhoc.mobileprovision"
+
+          echo "Profile size: $(wc -c < "$PROFILES_DIR/h2v_adhoc.mobileprovision" | tr -d ' ') bytes"
 
       # ── 5. Build & Archive ────────────────────────────────────────────────────
       - name: Build archive
