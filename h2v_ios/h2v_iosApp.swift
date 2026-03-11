@@ -216,11 +216,21 @@ struct h2v_iosApp: App {
                 .onChange(of: appState.isAuthenticated) { _, authenticated in
                     if authenticated { NotificationManager.shared.clearBadge() }
                 }
-                // Reconnect WS immediately when app returns to foreground
+                // Always force a fresh WS connection when app comes to foreground.
+                // We cannot trust isConnected — iOS can suspend the task while
+                // leaving isConnected = true, causing silent send failures.
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .active && appState.isAuthenticated {
-                        NotificationManager.shared.clearBadge()
-                        WebSocketClient.shared.reconnectNow()
+                    switch phase {
+                    case .active:
+                        if appState.isAuthenticated {
+                            NotificationManager.shared.clearBadge()
+                            WebSocketClient.shared.forceReconnect()
+                        }
+                    case .background:
+                        // Mark as disconnected so state is clean on next activation
+                        WebSocketClient.shared.markDisconnectedForBackground()
+                    default:
+                        break
                     }
                 }
                 // Navigate to chat on notification tap

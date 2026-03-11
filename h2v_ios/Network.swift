@@ -296,6 +296,20 @@ final class APIClient {
         )
     }
 
+    /// HTTP fallback for sending a text message when WebSocket is unavailable.
+    func sendMessageHTTP(chatId: String, text: String, type: String = "TEXT",
+                         mediaUrl: String? = nil, replyToId: String? = nil) async throws -> Message {
+        struct Body: Encodable {
+            let text: String; let type: String
+            let mediaUrl: String?; let replyToId: String?
+        }
+        return try await request(
+            path: "/api/chats/\(chatId)/messages",
+            method: "POST",
+            bodyData: try body(Body(text: text, type: type, mediaUrl: mediaUrl, replyToId: replyToId))
+        )
+    }
+
     func addReaction(messageId: String, emoji: String) async throws {
         struct B: Encodable { let emoji: String }
         struct R: Decodable { let id: String }
@@ -423,14 +437,26 @@ final class WebSocketClient: ObservableObject {
         _connect(token: t)
     }
 
-    /// Force-reconnect even if currently connected (e.g. after token rotation).
+    /// Force-reconnect even if currently connected (e.g. app returns from background).
     func forceReconnect(token: String? = nil) {
         let t = token ?? TokenStorage.shared.accessToken
         guard let t else { return }
         _connect(token: t)
     }
 
-    /// Reconnect immediately with zero backoff (called when app becomes active).
+    /// Called when app enters background: mark connection as stale.
+    /// iOS can suspend the URLSessionWebSocketTask while keeping isConnected = true,
+    /// leading to silent send failures on foreground. Marking false ensures
+    /// forceReconnect() creates a clean connection next time.
+    func markDisconnectedForBackground() {
+        pingTimer?.invalidate(); pingTimer = nil
+        connectionGeneration += 1   // invalidate in-flight receive callbacks
+        task?.cancel(); task = nil
+        isConnected = false
+        reconnectTask?.cancel(); reconnectTask = nil
+    }
+
+    /// Reconnect immediately with zero backoff (used from scheduleReconnect fallback).
     func reconnectNow() {
         guard let token = TokenStorage.shared.accessToken else { return }
         guard !isConnected else { return }

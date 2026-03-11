@@ -72,14 +72,40 @@ class ChatViewModel: ObservableObject {
     func sendText(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        guard ensureConnected() else {
-            sendError = "Нет подключения. Проверьте сеть."
-            return
-        }
         sendError = nil
         let rid = replyTo?.id
         replyTo = nil
-        WebSocketClient.shared.sendMessage(chatId: chat.id, text: trimmed, type: "TEXT", replyToId: rid)
+
+        if WebSocketClient.shared.isConnected {
+            // Happy path: WS is live, send instantly
+            WebSocketClient.shared.sendMessage(chatId: chat.id, text: trimmed, type: "TEXT", replyToId: rid)
+        } else {
+            // WS not yet connected (e.g. just returned from background).
+            // Try to reconnect, wait up to 1.5 s, then fall back to HTTP.
+            WebSocketClient.shared.forceReconnect()
+            Task {
+                var waited = 0
+                while !WebSocketClient.shared.isConnected && waited < 15 {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
+                    waited += 1
+                }
+                if WebSocketClient.shared.isConnected {
+                    WebSocketClient.shared.sendMessage(chatId: self.chat.id, text: trimmed, type: "TEXT", replyToId: rid)
+                } else {
+                    // HTTP fallback — message still goes through even without WS
+                    do {
+                        let msg = try await APIClient.shared.sendMessageHTTP(
+                            chatId: self.chat.id, text: trimmed, replyToId: rid)
+                        if !self.messages.contains(where: { $0.id == msg.id }) {
+                            self.messages.append(msg)
+                            MessageCache.shared.save(self.messages, for: self.chat.id)
+                        }
+                    } catch {
+                        self.sendError = "Ошибка отправки. Попробуйте снова."
+                    }
+                }
+            }
+        }
     }
 
     func sendImage(_ item: PhotosPickerItem) {
@@ -241,9 +267,7 @@ class ChatViewModel: ObservableObject {
     @discardableResult
     private func ensureConnected() -> Bool {
         if WebSocketClient.shared.isConnected { return true }
-        if let token = TokenStorage.shared.accessToken {
-            WebSocketClient.shared.connect(token: token)
-        }
+        WebSocketClient.shared.forceReconnect()
         return WebSocketClient.shared.isConnected
     }
 }
