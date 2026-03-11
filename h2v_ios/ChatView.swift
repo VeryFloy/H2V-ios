@@ -12,17 +12,19 @@ class ChatViewModel: ObservableObject {
     /// userId → nickname for people currently typing
     @Published var typingUsers: [String: String] = [:]
     @Published var errorMsg: String?
+    /// Message currently being replied to
+    @Published var replyTo: Message? = nil
     var currentUserId: String?
     private(set) var hasMore = true
     private var nextCursor: String? = nil
     let chat: Chat
+    /// Last messageId for which we sent a read receipt (deduplication)
+    private var lastSentReadId: String? = nil
 
     init(chat: Chat) { self.chat = chat }
 
-    // Convenience: IDs only
     var typingUserIds: Set<String> { Set(typingUsers.keys) }
 
-    // Human-readable typing label
     var typingLabel: String? {
         guard !typingUsers.isEmpty else { return nil }
         let names = typingUsers.values.map { "@\($0)" }
@@ -46,6 +48,7 @@ class ChatViewModel: ObservableObject {
                 if refresh { messages = msgs } else { messages.insert(contentsOf: msgs, at: 0) }
                 nextCursor = data.nextCursor
                 hasMore = data.nextCursor != nil
+                markLastMessageRead()
             } catch { errorMsg = error.localizedDescription }
             isLoading = false
         }
@@ -59,7 +62,9 @@ class ChatViewModel: ObservableObject {
             return
         }
         sendError = nil
-        WebSocketClient.shared.sendMessage(chatId: chat.id, text: trimmed, type: "TEXT")
+        let rid = replyTo?.id
+        replyTo = nil
+        WebSocketClient.shared.sendMessage(chatId: chat.id, text: trimmed, type: "TEXT", replyToId: rid)
     }
 
     func sendImage(_ item: PhotosPickerItem) {
@@ -73,8 +78,10 @@ class ChatViewModel: ObservableObject {
                     isUploading = false
                     return
                 }
-                WebSocketClient.shared.sendMessage(chatId: chat.id, text: upload.url,
-                                                   type: "IMAGE", mediaUrl: upload.url)
+                let rid = replyTo?.id
+                replyTo = nil
+                WebSocketClient.shared.sendMessage(chatId: chat.id, text: "",
+                                                   type: "IMAGE", mediaUrl: upload.url, replyToId: rid)
             } catch { errorMsg = error.localizedDescription }
             isUploading = false
         }
@@ -87,6 +94,31 @@ class ChatViewModel: ObservableObject {
         }
     }
 
+    func editMessage(id: String, newText: String) {
+        Task {
+            do {
+                let updated = try await APIClient.shared.editMessage(id: id, text: newText)
+                if let i = messages.firstIndex(where: { $0.id == id }) {
+                    messages[i] = updated
+                }
+            } catch { errorMsg = error.localizedDescription }
+        }
+    }
+
+    func toggleReaction(messageId: String, emoji: String) {
+        guard let msg = messages.first(where: { $0.id == messageId }) else { return }
+        let alreadyReacted = msg.reactions?.contains { $0.userId == currentUserId && $0.emoji == emoji } ?? false
+        Task {
+            do {
+                if alreadyReacted {
+                    try await APIClient.shared.removeReaction(messageId: messageId, emoji: emoji)
+                } else {
+                    try await APIClient.shared.addReaction(messageId: messageId, emoji: emoji)
+                }
+            } catch { errorMsg = error.localizedDescription }
+        }
+    }
+
     func sendTyping() {
         let ud = UserDefaults.standard
         let enabled = ud.object(forKey: "h2v.typingIndicator") == nil || ud.bool(forKey: "h2v.typingIndicator")
@@ -95,9 +127,11 @@ class ChatViewModel: ObservableObject {
     }
     func stopTyping() { WebSocketClient.shared.typingStop(chatId: chat.id) }
 
+    // MARK: - WS Event Handler
+
     func handleEvent(_ event: WSEvent) {
         switch event.type {
-        // Messages
+
         case "message:new", "new_message":
             guard let msg = event.decodeMessage() else { return }
             let inThisChat = msg.chatId == chat.id
@@ -105,12 +139,53 @@ class ChatViewModel: ObservableObject {
             guard inThisChat else { return }
             if !messages.contains(where: { $0.id == msg.id }) {
                 messages.append(msg)
+                if msg.sender.id != currentUserId {
+                    markLastMessageRead()
+                }
+            }
+
+        case "message:edited":
+            guard let msg = event.decodeMessage() else { return }
+            if let i = messages.firstIndex(where: { $0.id == msg.id }) {
+                messages[i] = msg
             }
 
         case "message:deleted", "message_deleted":
             if let id = event.messageId { messages.removeAll { $0.id == id } }
 
-        // Typing — server broadcasts "typing:started" / "typing:stopped"
+        case "message:read":
+            guard let msgId = event.rawPayload["messageId"] as? String else { return }
+            let userId = event.rawPayload["userId"] as? String ?? event.userId ?? ""
+            let readAt = event.rawPayload["readAt"] as? String
+                ?? ISO8601DateFormatter().string(from: Date())
+            let receipt = ReadReceipt(userId: userId, readAt: readAt)
+            guard let targetIdx = messages.firstIndex(where: { $0.id == msgId }) else { return }
+            for i in 0...targetIdx {
+                guard messages[i].sender.id == currentUserId else { continue }
+                if !(messages[i].readReceipts?.contains(where: { $0.userId == userId }) ?? false) {
+                    messages[i].readReceipts = (messages[i].readReceipts ?? []) + [receipt]
+                }
+            }
+
+        case "reaction:added":
+            let rDict = event.rawPayload["reaction"] as? [String: Any] ?? event.rawPayload
+            guard let msgId    = rDict["messageId"] as? String,
+                  let rId      = rDict["id"]        as? String,
+                  let rUserId  = rDict["userId"]    as? String,
+                  let rEmoji   = rDict["emoji"]     as? String else { return }
+            guard let i = messages.firstIndex(where: { $0.id == msgId }) else { return }
+            let newR = Reaction(id: rId, userId: rUserId, emoji: rEmoji)
+            if !(messages[i].reactions?.contains(where: { $0.id == rId }) ?? false) {
+                messages[i].reactions = (messages[i].reactions ?? []) + [newR]
+            }
+
+        case "reaction:removed":
+            let msgId  = event.rawPayload["messageId"] as? String ?? event.messageId ?? ""
+            let userId = event.rawPayload["userId"]    as? String ?? ""
+            let emoji  = event.rawPayload["emoji"]     as? String ?? ""
+            guard !msgId.isEmpty, let i = messages.firstIndex(where: { $0.id == msgId }) else { return }
+            messages[i].reactions?.removeAll { $0.userId == userId && $0.emoji == emoji }
+
         case "typing:started", "typing:start":
             guard let uid = event.userId, uid != currentUserId else { return }
             let eid = event.rawPayload["chatId"] as? String
@@ -119,7 +194,6 @@ class ChatViewModel: ObservableObject {
                 ?? chat.members.first(where: { $0.userId == uid })?.user.nickname
                 ?? uid
             typingUsers[uid] = nick
-            // Auto-clear after 5s in case typing:stopped is missed
             Task {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 typingUsers.removeValue(forKey: uid)
@@ -133,7 +207,20 @@ class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: Private
+    // MARK: - Read Receipts
+
+    func markLastMessageRead() {
+        let sendReceipts = UserDefaults.standard.object(forKey: "h2v.readReceipts") == nil
+            || UserDefaults.standard.bool(forKey: "h2v.readReceipts")
+        guard sendReceipts else { return }
+        guard let lastMsg = messages.last(where: { $0.sender.id != currentUserId && !($0.isDeleted ?? false) })
+        else { return }
+        guard lastMsg.id != lastSentReadId else { return }
+        lastSentReadId = lastMsg.id
+        WebSocketClient.shared.markRead(messageId: lastMsg.id, chatId: chat.id)
+    }
+
+    // MARK: - Private
 
     @discardableResult
     private func ensureConnected() -> Bool {
@@ -158,6 +245,7 @@ struct ChatView: View {
     @State private var mediaViewerURLs: [URL] = []
     @State private var mediaViewerIndex: Int = 0
     @State private var showMediaViewer = false
+    @State private var wsSubscriberID: UUID? = nil
 
     init(chat: Chat) {
         _vm = StateObject(wrappedValue: ChatViewModel(chat: chat))
@@ -186,6 +274,10 @@ struct ChatView: View {
                 }
                 messageArea
                 Divider().background(Color.glassBorder)
+                // Reply bar
+                if let reply = vm.replyTo {
+                    replyBar(for: reply)
+                }
                 inputBar
             }
         }
@@ -195,19 +287,20 @@ struct ChatView: View {
             vm.currentUserId = appState.currentUser?.id
             appState.activeChatId = vm.chat.id
             vm.loadMessages(refresh: true)
-            WebSocketClient.shared.onEvent = { [weak vm] event in
-                Task { @MainActor in
-                    vm?.handleEvent(event)
-                    appState.handlePresence(event: event)
-                }
+            wsSubscriberID = WebSocketClient.shared.subscribe { [weak vm] event in
+                vm?.handleEvent(event)
             }
         }
         .onDisappear {
             appState.activeChatId = nil
             stopTypingNow()
-            WebSocketClient.shared.onEvent = { [weak appState] event in
-                Task { @MainActor in appState?.handlePresence(event: event) }
+            if let id = wsSubscriberID {
+                WebSocketClient.shared.unsubscribe(id)
+                wsSubscriberID = nil
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            vm.markLastMessageRead()
         }
         .fullScreenCover(isPresented: $showMediaViewer) {
             MediaViewer(urls: mediaViewerURLs, initialIndex: mediaViewerIndex, isPresented: $showMediaViewer)
@@ -310,6 +403,42 @@ struct ChatView: View {
 
     // MARK: Message Area
 
+    // MARK: - Date separator helpers
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "d MMMM"
+        return f
+    }()
+
+    private static let dateFmtYear: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = "d MMMM yyyy"
+        return f
+    }()
+
+    private func dateSeparatorText(for date: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(date)     { return "Сегодня" }
+        if cal.isDateInYesterday(date) { return "Вчера" }
+        let isSameYear = cal.isDate(date, equalTo: Date(), toGranularity: .year)
+        return isSameYear
+            ? Self.dateFmt.string(from: date)
+            : Self.dateFmtYear.string(from: date)
+    }
+
+    private func showSeparator(before index: Int) -> Bool {
+        guard index < vm.messages.count else { return false }
+        if index == 0 { return true }
+        let curr = vm.messages[index].createdDate
+        let prev = vm.messages[index - 1].createdDate
+        return !Calendar.current.isDate(curr, inSameDayAs: prev)
+    }
+
+    // MARK: - Message area
+
     private var messageArea: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -321,15 +450,15 @@ struct ChatView: View {
                             .onAppear { vm.loadMessages() }
                     }
 
-                    if !vm.messages.isEmpty {
-                        DateSeparator(text: "Сегодня")
-                            .padding(.vertical, 8)
-                    }
-
                     ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
                         let isMe = msg.sender.id == (vm.currentUserId ?? "")
                         let prevMsg = idx > 0 ? vm.messages[idx - 1] : nil
                         let sameSender = prevMsg?.sender.id == msg.sender.id
+
+                        if showSeparator(before: idx) {
+                            DateSeparator(text: dateSeparatorText(for: msg.createdDate))
+                                .padding(.vertical, 8)
+                        }
 
                         MessageBubbleView(message: msg, isMe: isMe, sameSender: sameSender,
                                           chatType: vm.chat.type) { url in
@@ -376,16 +505,94 @@ struct ChatView: View {
 
     @ViewBuilder
     private func contextMenuItems(msg: Message, isMe: Bool) -> some View {
-        Button {
-            UIPasteboard.general.string = msg.text
-        } label: {
-            Label("Копировать", systemImage: "doc.on.doc")
+        // Reaction picker
+        let reactions = ["👍", "❤️", "😂", "😮", "😢", "🔥"]
+        HStack(spacing: 4) {
+            ForEach(reactions, id: \.self) { emoji in
+                Button {
+                    vm.toggleReaction(messageId: msg.id, emoji: emoji)
+                } label: {
+                    Text(emoji).font(.title2)
+                }
+            }
         }
-        if isMe {
+
+        Divider()
+
+        Button {
+            vm.replyTo = msg
+        } label: {
+            Label("Ответить", systemImage: "arrowshape.turn.up.left")
+        }
+
+        if let text = msg.text, !text.isEmpty {
+            Button {
+                UIPasteboard.general.string = text
+            } label: {
+                Label("Копировать", systemImage: "doc.on.doc")
+            }
+        }
+
+        if isMe && !(msg.isDeleted ?? false) {
+            if msg.messageType == .text, let text = msg.text {
+                Button {
+                    inputText = text
+                    // Indicate editing by setting reply bar placeholder
+                    // Full inline edit could be a future enhancement
+                } label: {
+                    Label("Редактировать", systemImage: "pencil")
+                }
+            }
+
             Button(role: .destructive) { vm.deleteMessage(msg.id) } label: {
                 Label("Удалить", systemImage: "trash")
             }
         }
+    }
+
+    // MARK: Reply Bar
+
+    private func replyBar(for msg: Message) -> some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(Color(hex: "5E8CFF"))
+                .frame(width: 3)
+                .cornerRadius(2)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("@\(msg.sender.nickname)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color(hex: "5E8CFF"))
+                    .lineLimit(1)
+                Group {
+                    if msg.messageType == .image {
+                        Text("📷 Фото")
+                    } else {
+                        Text(msg.text ?? "")
+                    }
+                }
+                .font(.system(size: 12))
+                .foregroundStyle(Color.textSecondary)
+                .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button {
+                vm.replyTo = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .background(Color.white.opacity(0.08), in: Circle())
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.glassSurface.opacity(0.4))
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .animation(.easeInOut(duration: 0.18), value: vm.replyTo?.id)
     }
 
     // MARK: Input Bar
@@ -547,7 +754,16 @@ struct MessageBubbleView: View {
                     textContent
                 }
 
+                // Reactions strip
+                reactionsStrip
+
                 HStack(spacing: 3) {
+                    if message.isEdited == true {
+                        Text("изменено")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.white.opacity(0.18))
+                            .italic()
+                    }
                     Text(MessageTime.shortTime(from: message.createdAt))
                         .font(.system(size: 11))
                         .foregroundStyle(Color.white.opacity(0.2))
@@ -555,7 +771,7 @@ struct MessageBubbleView: View {
                         let isRead = !(message.readReceipts?.isEmpty ?? true)
                         Image(systemName: isRead ? "checkmark.message" : "checkmark")
                             .font(.system(size: 9))
-                            .foregroundStyle(Color.white.opacity(0.3))
+                            .foregroundStyle(isRead ? Color(hex: "5E8CFF").opacity(0.8) : Color.white.opacity(0.3))
                     }
                 }
                 .padding(.horizontal, 4)
@@ -565,17 +781,103 @@ struct MessageBubbleView: View {
         }
     }
 
+    // MARK: - Reply quote
+
+    @ViewBuilder
+    private var replyQuote: some View {
+        if let reply = message.replyTo {
+            HStack(spacing: 6) {
+                Rectangle()
+                    .fill(Color(hex: "5E8CFF").opacity(0.7))
+                    .frame(width: 3)
+                    .cornerRadius(1.5)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("@\(reply.sender.nickname)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color(hex: "5E8CFF").opacity(0.9))
+                        .lineLimit(1)
+                    if reply.isDeleted == true {
+                        Text("Сообщение удалено")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.textTertiary)
+                            .italic()
+                    } else {
+                        Text(reply.text ?? "Медиа")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.textSecondary)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
+
+    // MARK: - Reactions strip
+
+    @ViewBuilder
+    private var reactionsStrip: some View {
+        let grouped = groupedReactions
+        if !grouped.isEmpty {
+            HStack(spacing: 4) {
+                ForEach(grouped, id: \.emoji) { item in
+                    Text(item.count > 1 ? "\(item.emoji) \(item.count)" : item.emoji)
+                        .font(.system(size: 13))
+                        .padding(.horizontal, item.count > 1 ? 7 : 5)
+                        .padding(.vertical, 3)
+                        .background(
+                            item.mine
+                                ? Color(hex: "5E8CFF").opacity(0.28)
+                                : Color.white.opacity(0.1),
+                            in: Capsule()
+                        )
+                        .overlay(
+                            Capsule().stroke(
+                                item.mine ? Color(hex: "5E8CFF").opacity(0.5) : Color.white.opacity(0.12),
+                                lineWidth: 0.5
+                            )
+                        )
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    private struct ReactionGroup { let emoji: String; let count: Int; let mine: Bool }
+
+    private var groupedReactions: [ReactionGroup] {
+        guard let reactions = message.reactions, !reactions.isEmpty else { return [] }
+        var dict: [String: (count: Int, mine: Bool)] = [:]
+        for r in reactions {
+            let existing = dict[r.emoji] ?? (count: 0, mine: false)
+            dict[r.emoji] = (count: existing.count + 1, mine: existing.mine)
+        }
+        return dict.map { ReactionGroup(emoji: $0.key, count: $0.value.count, mine: $0.value.mine) }
+            .sorted { $0.count > $1.count }
+    }
+
     private var textContent: some View {
-        Text(message.text ?? "")
-            .font(.system(size: fontSize))
-            .foregroundStyle(isMe && bubbleStyle == "gradient"
-                ? Color.white
-                : Color.textPrimary)
-            .tracking(-0.1)
-            .lineSpacing(2)
-            .padding(.horizontal, 13)
-            .padding(.vertical, 9)
-            .background { bubbleBackground }
+        VStack(alignment: .leading, spacing: 0) {
+            replyQuote
+                .padding(.top, message.replyTo != nil ? 6 : 0)
+                .padding(.horizontal, message.replyTo != nil ? 4 : 0)
+
+            Text(message.isDeleted == true ? "Сообщение удалено" : (message.text ?? ""))
+                .font(.system(size: message.isDeleted == true ? fontSize - 1 : fontSize))
+                .foregroundStyle(
+                    message.isDeleted == true
+                        ? Color.textTertiary.opacity(0.6)
+                        : (isMe && bubbleStyle == "gradient" ? Color.white : Color.textPrimary)
+                )
+                .italic(message.isDeleted == true)
+                .tracking(-0.1)
+                .lineSpacing(2)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 9)
+        }
+        .background { bubbleBackground }
     }
 
     @ViewBuilder

@@ -12,6 +12,8 @@ final class NotificationManager: NSObject, ObservableObject {
 
     var isAuthorized: Bool { authorizationStatus == .authorized }
 
+    private var badgeCount = 0
+
     override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
@@ -49,7 +51,8 @@ final class NotificationManager: NSObject, ObservableObject {
 
         let badgeEnabled = ud.object(forKey: "h2v.notifBadge") == nil || ud.bool(forKey: "h2v.notifBadge")
         if badgeEnabled {
-            content.badge = 1
+            badgeCount += 1
+            content.badge = NSNumber(value: badgeCount)
         }
 
         content.userInfo = ["chatId": chatId]
@@ -60,6 +63,7 @@ final class NotificationManager: NSObject, ObservableObject {
     }
 
     func clearBadge() {
+        badgeCount = 0
         UNUserNotificationCenter.current().setBadgeCount(0)
     }
 }
@@ -79,6 +83,15 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completion: @escaping () -> Void
     ) {
+        if let chatId = response.notification.request.content.userInfo["chatId"] as? String {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: Notification.Name("h2v.openChat"),
+                    object: nil,
+                    userInfo: ["chatId": chatId]
+                )
+            }
+        }
         completion()
     }
 }

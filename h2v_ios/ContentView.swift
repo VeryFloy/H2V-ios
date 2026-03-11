@@ -11,7 +11,6 @@ struct ContentView: View {
                 AuthView()
             }
         }
-        .preferredColorScheme(.dark)
     }
 }
 

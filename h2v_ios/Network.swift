@@ -60,14 +60,15 @@ enum NetworkError: LocalizedError {
 final class APIClient {
     static let shared = APIClient()
 
-    // MARK: - Core request
+    // MARK: - Core HTTP (shared, with automatic token-refresh on 401)
 
-    private func request<T: Decodable>(
+    private func performHTTP(
         path: String,
-        method: String = "GET",
-        bodyData: Data? = nil,
-        authenticated: Bool = true
-    ) async throws -> T {
+        method: String,
+        bodyData: Data?,
+        authenticated: Bool,
+        isRetry: Bool = false
+    ) async throws -> Data {
         guard let url = URL(string: Config.baseURL + path) else { throw NetworkError.invalidURL }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -79,12 +80,35 @@ final class APIClient {
         req.httpBody = bodyData
 
         let (data, response) = try await URLSession.shared.data(for: req)
-        if (response as? HTTPURLResponse)?.statusCode == 401 { throw NetworkError.unauthorized }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
+        if statusCode == 401 {
+            if authenticated && !isRetry {
+                if let tokens = try? await refreshTokens() {
+                    TokenStorage.shared.save(tokens: tokens)
+                    await MainActor.run { WebSocketClient.shared.connect() }
+                    return try await performHTTP(path: path, method: method, bodyData: bodyData,
+                                                 authenticated: authenticated, isRetry: true)
+                }
+            }
+            throw NetworkError.unauthorized
+        }
+        return data
+    }
+
+    // MARK: - Core request
+
+    private func request<T: Decodable>(
+        path: String,
+        method: String = "GET",
+        bodyData: Data? = nil,
+        authenticated: Bool = true
+    ) async throws -> T {
+        let data = try await performHTTP(path: path, method: method, bodyData: bodyData,
+                                         authenticated: authenticated)
         do {
             let envelope = try JSONDecoder().decode(APIResponse<T>.self, from: data)
             if let result = envelope.data { return result }
-            // Map known error codes to typed errors
             switch envelope.code {
             case "NICKNAME_REQUIRED":             throw NetworkError.nicknameRequired
             case "OTP_EXPIRED", "INVALID_CODE":   throw NetworkError.otpExpired
@@ -113,17 +137,8 @@ final class APIClient {
         bodyData: Data? = nil,
         authenticated: Bool = true
     ) async throws {
-        guard let url = URL(string: Config.baseURL + path) else { throw NetworkError.invalidURL }
-        var req = URLRequest(url: url)
-        req.httpMethod = method
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if authenticated {
-            guard let token = TokenStorage.shared.accessToken else { throw NetworkError.noToken }
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        req.httpBody = bodyData
-        let (data, response) = try await URLSession.shared.data(for: req)
-        if (response as? HTTPURLResponse)?.statusCode == 401 { throw NetworkError.unauthorized }
+        let data = try await performHTTP(path: path, method: method, bodyData: bodyData,
+                                          authenticated: authenticated)
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             let success = json["success"] as? Bool ?? true
             if !success {
@@ -238,8 +253,11 @@ final class APIClient {
         return try await request(path: path)
     }
 
-    func deleteMessage(id: String) async throws {
-        let _: MessageResponse = try await request(path: "/api/messages/\(id)", method: "DELETE")
+    func deleteMessage(id: String, forEveryone: Bool = true) async throws {
+        let _: MessageResponse = try await request(
+            path: "/api/messages/\(id)?forEveryone=\(forEveryone)",
+            method: "DELETE"
+        )
     }
 
     func editMessage(id: String, text: String) async throws -> Message {
@@ -278,7 +296,8 @@ final class APIClient {
 
     // MARK: - Upload
 
-    func uploadFile(data fileData: Data, filename: String, mimeType: String) async throws -> UploadResult {
+    func uploadFile(data fileData: Data, filename: String, mimeType: String,
+                    isRetry: Bool = false) async throws -> UploadResult {
         guard let url = URL(string: Config.baseURL + "/api/upload") else { throw NetworkError.invalidURL }
         guard let token = TokenStorage.shared.accessToken else { throw NetworkError.noToken }
         var req = URLRequest(url: url)
@@ -295,7 +314,14 @@ final class APIClient {
         body += "\(nl)--\(boundary)--\(nl)".data(using: .utf8)!
         req.httpBody = body
         let (respData, response) = try await URLSession.shared.data(for: req)
-        if (response as? HTTPURLResponse)?.statusCode == 401 { throw NetworkError.unauthorized }
+        if (response as? HTTPURLResponse)?.statusCode == 401 {
+            if !isRetry, let tokens = try? await refreshTokens() {
+                TokenStorage.shared.save(tokens: tokens)
+                await MainActor.run { WebSocketClient.shared.connect() }
+                return try await uploadFile(data: fileData, filename: filename, mimeType: mimeType, isRetry: true)
+            }
+            throw NetworkError.unauthorized
+        }
         let decoded = try JSONDecoder().decode(APIResponse<UploadResult>.self, from: respData)
         guard let result = decoded.data else {
             throw NetworkError.serverError(decoded.message ?? "Upload failed")
@@ -328,27 +354,80 @@ final class WebSocketClient: ObservableObject {
     static let shared = WebSocketClient()
 
     @Published var isConnected = false
-    var onEvent: ((WSEvent) -> Void)?
 
+    // MARK: - Multicast subscribers
+    private var subscribers: [UUID: (WSEvent) -> Void] = [:]
+
+    @discardableResult
+    func subscribe(_ handler: @escaping (WSEvent) -> Void) -> UUID {
+        let id = UUID()
+        subscribers[id] = handler
+        return id
+    }
+
+    func unsubscribe(_ id: UUID) {
+        subscribers.removeValue(forKey: id)
+    }
+
+    // MARK: - Connection internals
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectDelay: TimeInterval = 1.0
 
-    func connect(token: String) {
-        disconnect()
+    // MARK: - Public API
+
+    /// Connect using a specific token (also used after token refresh).
+    /// Passing nil reads the current token from TokenStorage.
+    func connect(token: String? = nil) {
+        let t = token ?? TokenStorage.shared.accessToken
+        guard let t else { return }
+        _connect(token: t)
+    }
+
+    /// Intentional disconnect (logout). Cancels any pending reconnect.
+    func disconnect() {
+        reconnectTask?.cancel(); reconnectTask = nil
+        reconnectDelay = 1.0
+        _teardown()
+    }
+
+    // MARK: - Private
+
+    private func _connect(token: String) {
+        reconnectTask?.cancel(); reconnectTask = nil
+        _teardown()
         guard let url = URL(string: "\(Config.wsURL)?token=\(token)") else { return }
         task = URLSession.shared.webSocketTask(with: url)
         task?.resume()
+        // Send auth handshake as first message (mirrors frontend behaviour,
+        // keeps token out of server logs)
+        send(event: "auth", payload: ["token": token])
         isConnected = true
         receive()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.send(event: "presence:ping") }
         }
+        reconnectDelay = 1.0
     }
 
-    func disconnect() {
+    private func _teardown() {
         pingTimer?.invalidate(); pingTimer = nil
         task?.cancel(with: .goingAway, reason: nil); task = nil
         isConnected = false
+    }
+
+    private func scheduleReconnect() {
+        guard TokenStorage.shared.accessToken != nil else { return }
+        guard !subscribers.isEmpty else { return }
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2, 30.0)
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self.connect()
+        }
     }
 
     private func receive() {
@@ -356,11 +435,17 @@ final class WebSocketClient: ObservableObject {
             switch result {
             case .success(let msg):
                 if case .string(let text) = msg {
-                    Task { @MainActor [weak self] in self?.handle(text) }
+                    Task { @MainActor [weak self] in
+                        self?.isConnected = true
+                        self?.handle(text)
+                    }
                 }
                 Task { @MainActor [weak self] in self?.receive() }
             case .failure:
-                Task { @MainActor [weak self] in self?.isConnected = false }
+                Task { @MainActor [weak self] in
+                    self?.isConnected = false
+                    self?.scheduleReconnect()
+                }
             }
         }
     }
@@ -372,9 +457,8 @@ final class WebSocketClient: ObservableObject {
             let eventType = json["event"] as? String
         else { return }
         let payload = json["payload"] as? [String: Any] ?? [:]
-        Task { @MainActor [weak self] in
-            self?.onEvent?(WSEvent(type: eventType, rawPayload: payload))
-        }
+        let event = WSEvent(type: eventType, rawPayload: payload)
+        subscribers.values.forEach { $0(event) }
     }
 
     func send(event: String, payload: [String: Any] = [:]) {

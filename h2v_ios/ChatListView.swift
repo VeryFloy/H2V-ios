@@ -10,6 +10,8 @@ class ChatListViewModel: ObservableObject {
     @Published var mutedIds: Set<String> = MuteManager.shared.mutedIds
     /// chatId → [userId: nickname] — who's currently typing in each chat
     @Published var typingPerChat: [String: [String: String]] = [:]
+    /// chatId → unread count
+    @Published var unreadCounts: [String: Int] = [:]
     private(set) var hasMore = true
     private var nextCursor: String? = nil
 
@@ -60,7 +62,10 @@ class ChatListViewModel: ObservableObject {
         }
     }
 
+    var currentUserId: String?
+
     func handleWSEvent(_ event: WSEvent, currentUserId: String?) {
+        self.currentUserId = currentUserId
         switch event.type {
         case "message:new", "new_message":
             guard let msg = event.decodeMessage() else { return }
@@ -73,10 +78,65 @@ class ChatListViewModel: ObservableObject {
                                members: updated.members, messages: [msg])
                 chats.remove(at: i)
                 chats.insert(updated, at: 0)
+            } else {
+                // New chat not yet in the list — refresh
+                loadChats(refresh: true)
             }
-            // Clear typing for this user+chat (they sent a message)
+            // Increment unread if message is from another user
+            if msg.sender.id != currentUserId {
+                unreadCounts[cid, default: 0] += 1
+            }
             if let uid = msg.sender.id as String? {
                 typingPerChat[cid]?.removeValue(forKey: uid)
+            }
+
+        case "chat:new":
+            if let chat = event.decode(as: Chat.self) {
+                if !chats.contains(where: { $0.id == chat.id }) {
+                    chats.insert(chat, at: 0)
+                }
+            }
+
+        case "chat:deleted":
+            if let cid = event.chatId { chats.removeAll { $0.id == cid } }
+
+        case "chat:updated":
+            guard let cid = event.chatId ?? (event.rawPayload["id"] as? String),
+                  let i = chats.firstIndex(where: { $0.id == cid }) else { return }
+            let p = event.rawPayload
+            let updated = Chat(
+                id: chats[i].id,
+                type: chats[i].type,
+                name: (p["name"] as? String) ?? chats[i].name,
+                avatar: (p["avatar"] as? String) ?? chats[i].avatar,
+                description: (p["description"] as? String) ?? chats[i].description,
+                createdAt: chats[i].createdAt,
+                updatedAt: chats[i].updatedAt,
+                members: chats[i].members,
+                messages: chats[i].messages
+            )
+            chats[i] = updated
+
+        case "chat:member-left":
+            guard let cid = event.chatId,
+                  let uid = event.userId,
+                  let i = chats.firstIndex(where: { $0.id == cid }) else { return }
+            var updated = chats[i]
+            let newMembers = updated.members.filter { $0.userId != uid }
+            updated = Chat(id: updated.id, type: updated.type, name: updated.name,
+                           avatar: updated.avatar, description: updated.description,
+                           createdAt: updated.createdAt, updatedAt: updated.updatedAt,
+                           members: newMembers, messages: updated.messages)
+            chats[i] = updated
+
+        case "message:deleted":
+            // If the deleted message was the preview of a chat row, clear it
+            guard let msgId = event.messageId else { return }
+            if let i = chats.firstIndex(where: { $0.lastMessage?.id == msgId }) {
+                let c = chats[i]
+                chats[i] = Chat(id: c.id, type: c.type, name: c.name, avatar: c.avatar,
+                                description: c.description, createdAt: c.createdAt,
+                                updatedAt: c.updatedAt, members: c.members, messages: nil)
             }
 
         case "typing:started", "typing:start":
@@ -88,7 +148,6 @@ class ChatListViewModel: ObservableObject {
                 ?? "..."
             if typingPerChat[cid] == nil { typingPerChat[cid] = [:] }
             typingPerChat[cid]?[uid] = nick
-            // Auto-clear after 5s
             Task {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 typingPerChat[cid]?.removeValue(forKey: uid)
@@ -115,6 +174,9 @@ struct ChatListView: View {
     @State private var showNewChat = false
     @State private var showNewGroup = false
     @State private var navPath = NavigationPath()
+    /// Chat ID waiting to be navigated to once chats are loaded
+    @State private var pendingNavigateChatId: String? = nil
+    @State private var wsSubscriberID: UUID? = nil
 
     private var filtered: [Chat] {
         let uid = appState.currentUser?.id ?? ""
@@ -149,25 +211,39 @@ struct ChatListView: View {
                 showTabBar = path.isEmpty
             }
             if path.isEmpty {
-                // Re-establish WS handler and refresh list on return from chat
-                WebSocketClient.shared.onEvent = { [weak vm] event in
-                    Task { @MainActor in
-                        vm?.handleWSEvent(event, currentUserId: appState.currentUser?.id)
-                        appState.handlePresence(event: event)
-                        appState.handleMessageNotification(event: event)
-                    }
-                }
                 Task { vm.loadChats(refresh: true) }
+            }
+        }
+        // When chats reload, check if there's a pending navigation
+        .onChange(of: vm.chats) { _, chats in
+            if let chatId = pendingNavigateChatId,
+               let chat = chats.first(where: { $0.id == chatId }) {
+                navPath.append(chat)
+                pendingNavigateChatId = nil
+            }
+        }
+        // Handle notification tap → navigate to the target chat
+        .onChange(of: appState.pendingOpenChatId) { _, chatId in
+            guard let chatId else { return }
+            appState.pendingOpenChatId = nil
+            if let chat = vm.chats.first(where: { $0.id == chatId }) {
+                navPath.append(chat)
+            } else {
+                pendingNavigateChatId = chatId
+                vm.loadChats(refresh: true)
             }
         }
         .onAppear {
             vm.loadChats(refresh: true)
-            WebSocketClient.shared.onEvent = { [weak vm] event in
-                Task { @MainActor in
-                    vm?.handleWSEvent(event, currentUserId: appState.currentUser?.id)
-                    appState.handlePresence(event: event)
-                    appState.handleMessageNotification(event: event)
-                }
+            let uid = appState.currentUser?.id
+            wsSubscriberID = WebSocketClient.shared.subscribe { [weak vm] event in
+                vm?.handleWSEvent(event, currentUserId: uid)
+            }
+        }
+        .onDisappear {
+            if let id = wsSubscriberID {
+                WebSocketClient.shared.unsubscribe(id)
+                wsSubscriberID = nil
             }
         }
         .sheet(isPresented: $showNewChat) {
@@ -241,10 +317,16 @@ struct ChatListView: View {
                         ? chat.members.filter { appState.onlineUserIds.contains($0.userId) }.count
                         : 0
 
+                    let unread = vm.unreadCounts[chat.id] ?? 0
+
                     ChatRowView(chat: chat, currentUserId: uid, isOnline: isOnline,
-                                isMuted: isMuted, typingLabel: typingText, groupOnlineCount: onlineCount)
+                                isMuted: isMuted, typingLabel: typingText,
+                                groupOnlineCount: onlineCount, unreadCount: unread)
                         .contentShape(Rectangle())
-                        .onTapGesture { navPath.append(chat) }
+                        .onTapGesture {
+                            vm.unreadCounts[chat.id] = 0
+                            navPath.append(chat)
+                        }
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button(role: .destructive) { vm.leaveChat(chat.id) } label: {
                                 Label("Покинуть", systemImage: "rectangle.portrait.and.arrow.right")
@@ -317,6 +399,7 @@ struct ChatRowView: View {
     var isMuted: Bool = false
     var typingLabel: String? = nil
     var groupOnlineCount: Int = 0
+    var unreadCount: Int = 0
 
     private var isGroup: Bool { chat.type == "GROUP" }
 
@@ -372,9 +455,23 @@ struct ChatRowView: View {
                         }
                     }
                     Spacer()
-                    Text(timeStr)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color.textTertiary)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(timeStr)
+                            .font(.system(size: 11))
+                            .foregroundStyle(unreadCount > 0 ? Color(hex: "5E8CFF") : Color.textTertiary)
+                        if unreadCount > 0 && !isMuted {
+                            Text(unreadCount > 99 ? "99+" : "\(unreadCount)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color(hex: "5E8CFF"), in: Capsule())
+                        } else if unreadCount > 0 && isMuted {
+                            Circle()
+                                .fill(Color.textTertiary)
+                                .frame(width: 8, height: 8)
+                        }
+                    }
                 }
                 // Subtitle: typing > last message > online
                 HStack(alignment: .center) {
