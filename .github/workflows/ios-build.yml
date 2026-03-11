@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     name: Build IPA (Ad Hoc)
-    runs-on: macos-15
+    runs-on: macos-14
 
     steps:
       - name: Checkout
@@ -23,11 +23,13 @@ jobs:
           fi
           echo "URLs OK"
 
-      # ── 2. Select Xcode 16 ────────────────────────────────────────────────────
+      # ── 2. Select Xcode 15.2 (ships with iOS 17.2 SDK = build 23C54,
+      #       which matches the simulator runtimes available on this runner)
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer   || \
+          sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer || \
+          sudo xcode-select -s /Applications/Xcode_15.1.app/Contents/Developer || \
+          sudo xcode-select -s /Applications/Xcode_15.app/Contents/Developer   || \
           true
           xcodebuild -version
 
