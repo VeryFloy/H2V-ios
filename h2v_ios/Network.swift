@@ -193,6 +193,26 @@ final class APIClient {
 
     // MARK: - Users
 
+    // MARK: - Device Tokens (APNs)
+
+    func registerDeviceToken(_ token: String) async throws {
+        struct B: Encodable { let token: String; let platform: String }
+        try await requestVoid(
+            path: "/api/users/me/device-token",
+            method: "POST",
+            bodyData: try body(B(token: token, platform: "IOS"))
+        )
+    }
+
+    func unregisterDeviceToken(_ token: String) async throws {
+        struct B: Encodable { let token: String }
+        try await requestVoid(
+            path: "/api/users/me/device-token",
+            method: "DELETE",
+            bodyData: try body(B(token: token))
+        )
+    }
+
     func getMe() async throws -> User { try await request(path: "/api/users/me") }
 
     func updateMe(nickname: String? = nil, bio: String? = nil, avatar: String? = nil) async throws -> User {

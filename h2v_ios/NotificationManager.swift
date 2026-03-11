@@ -9,10 +9,12 @@ final class NotificationManager: NSObject, ObservableObject {
     static let shared = NotificationManager()
 
     @Published var authorizationStatus: UNAuthorizationStatus = .notDetermined
+    @Published var apnsToken: String? = nil
 
     var isAuthorized: Bool { authorizationStatus == .authorized }
 
     private var badgeCount = 0
+    private var avatarCache: [String: URL] = [:]   // senderName → local file URL
 
     override init() {
         super.init()
@@ -25,16 +27,39 @@ final class NotificationManager: NSObject, ObservableObject {
         authorizationStatus = settings.authorizationStatus
     }
 
+    // MARK: - Permission + APNs Registration
+
     func requestPermission() async {
         do {
             let granted = try await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .badge, .sound])
+                .requestAuthorization(options: [.alert, .badge, .sound, .provisional])
             authorizationStatus = granted ? .authorized : .denied
+            if granted {
+                await MainActor.run {
+                    UIApplication.shared.registerForRemoteNotifications()
+                }
+            }
         } catch {}
     }
 
-    /// Sends a local notification for a new message (respects mute + user toggles).
-    func notifyNewMessage(senderName: String, text: String, chatId: String) {
+    /// Called by AppDelegate-adapter when APNs gives us the device token.
+    func didRegisterForRemoteNotifications(deviceToken: Data) {
+        let tokenString = deviceToken.map { String(format: "%02x", $0) }.joined()
+        apnsToken = tokenString
+        Task {
+            try? await APIClient.shared.registerDeviceToken(tokenString)
+        }
+    }
+
+    /// Called when APNs registration fails (e.g. simulator).
+    func didFailToRegisterForRemoteNotifications(error: Error) {
+        print("[APNs] Registration failed: \(error.localizedDescription)")
+    }
+
+    // MARK: - Local notification (from WebSocket while app is active)
+
+    func notifyNewMessage(senderName: String, text: String, chatId: String,
+                          avatarURL: URL? = nil) {
         guard isAuthorized else { return }
         guard !MuteManager.shared.isMuted(chatId) else { return }
 
@@ -42,31 +67,88 @@ final class NotificationManager: NSObject, ObservableObject {
         guard ud.object(forKey: "h2v.notifMessages") == nil
               || ud.bool(forKey: "h2v.notifMessages") else { return }
 
+        badgeCount += 1
+
         let content = UNMutableNotificationContent()
         content.title = senderName
         content.body = text.isEmpty ? "Новое сообщение" : text
+        content.badge = NSNumber(value: badgeCount)
+        content.userInfo = ["chatId": chatId]
+        content.threadIdentifier = chatId          // groups notifications by chat
 
-        let soundEnabled = ud.object(forKey: "h2v.notifSound") == nil || ud.bool(forKey: "h2v.notifSound")
+        let soundEnabled = ud.object(forKey: "h2v.notifSound") == nil
+            || ud.bool(forKey: "h2v.notifSound")
         content.sound = soundEnabled ? .default : nil
 
-        let badgeEnabled = ud.object(forKey: "h2v.notifBadge") == nil || ud.bool(forKey: "h2v.notifBadge")
-        if badgeEnabled {
-            badgeCount += 1
-            content.badge = NSNumber(value: badgeCount)
+        // If we already have the avatar cached, attach it immediately
+        if let localURL = avatarURL.flatMap({ avatarCache[$0.absoluteString] }) {
+            attachAvatarAndSchedule(content: content, avatarPath: localURL, chatId: chatId)
+        } else if let remoteURL = avatarURL {
+            // Download avatar in background, then schedule
+            Task {
+                let localURL = await downloadAvatar(from: remoteURL)
+                attachAvatarAndSchedule(content: content, avatarPath: localURL, chatId: chatId)
+            }
+        } else {
+            scheduleNotification(content: content, chatId: chatId)
         }
-
-        content.userInfo = ["chatId": chatId]
-
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.05, repeats: false)
-        let req = UNNotificationRequest(identifier: "msg-\(UUID().uuidString)", content: content, trigger: trigger)
-        UNUserNotificationCenter.current().add(req)
     }
+
+    // MARK: - Badge
 
     func clearBadge() {
         badgeCount = 0
         UNUserNotificationCenter.current().setBadgeCount(0)
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+    }
+
+    func decrementBadge(by amount: Int = 1) {
+        badgeCount = max(0, badgeCount - amount)
+        UNUserNotificationCenter.current().setBadgeCount(badgeCount)
+    }
+
+    // MARK: - Private helpers
+
+    private func downloadAvatar(from url: URL) async -> URL? {
+        // Return cached file URL if already downloaded
+        if let cached = avatarCache[url.absoluteString] {
+            return cached
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let tmpURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + ".jpg")
+            try data.write(to: tmpURL)
+            avatarCache[url.absoluteString] = tmpURL
+            return tmpURL
+        } catch {
+            return nil
+        }
+    }
+
+    private func attachAvatarAndSchedule(content: UNMutableNotificationContent,
+                                          avatarPath: URL?, chatId: String) {
+        if let path = avatarPath,
+           let attachment = try? UNNotificationAttachment(identifier: "avatar",
+                                                          url: path,
+                                                          options: nil) {
+            content.attachments = [attachment]
+        }
+        scheduleNotification(content: content, chatId: chatId)
+    }
+
+    private func scheduleNotification(content: UNMutableNotificationContent, chatId: String) {
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.05, repeats: false)
+        let req = UNNotificationRequest(
+            identifier: "msg-\(chatId)-\(UUID().uuidString)",
+            content: content,
+            trigger: trigger
+        )
+        UNUserNotificationCenter.current().add(req)
     }
 }
+
+// MARK: - UNUserNotificationCenterDelegate
 
 extension NotificationManager: UNUserNotificationCenterDelegate {
     // Show banner even when app is in foreground
@@ -78,6 +160,7 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
         completion([.banner, .sound, .badge])
     }
 
+    // Navigate to chat on notification tap
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
@@ -100,7 +183,6 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
 
 final class MuteManager {
     static let shared = MuteManager()
-
     private let key = "h2v.mutedChats"
 
     var mutedIds: Set<String> {

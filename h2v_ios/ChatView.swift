@@ -37,7 +37,16 @@ class ChatViewModel: ObservableObject {
 
     func loadMessages(refresh: Bool = false) {
         guard !isLoading else { return }
-        if refresh { nextCursor = nil; hasMore = true }
+        if refresh {
+            // Show cached messages instantly while network loads
+            let cached = MessageCache.shared.load(for: chat.id)
+            if !cached.isEmpty && messages.isEmpty {
+                messages = cached
+                markLastMessageRead()
+            }
+            nextCursor = nil
+            hasMore = true
+        }
         guard hasMore else { return }
         isLoading = true
         let cursor = nextCursor
@@ -45,7 +54,13 @@ class ChatViewModel: ObservableObject {
             do {
                 let data = try await APIClient.shared.getMessages(chatId: chat.id, cursor: cursor, limit: 40)
                 let msgs = data.messages.reversed() as [Message]
-                if refresh { messages = msgs } else { messages.insert(contentsOf: msgs, at: 0) }
+                if refresh {
+                    messages = msgs
+                    // Persist latest batch to cache
+                    MessageCache.shared.save(msgs, for: chat.id)
+                } else {
+                    messages.insert(contentsOf: msgs, at: 0)
+                }
                 nextCursor = data.nextCursor
                 hasMore = data.nextCursor != nil
                 markLastMessageRead()
@@ -139,6 +154,7 @@ class ChatViewModel: ObservableObject {
             guard inThisChat else { return }
             if !messages.contains(where: { $0.id == msg.id }) {
                 messages.append(msg)
+                MessageCache.shared.save(messages, for: chat.id)
                 if msg.sender.id != currentUserId {
                     markLastMessageRead()
                 }
